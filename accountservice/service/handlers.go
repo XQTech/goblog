@@ -8,13 +8,17 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/xqtech/goblog/accountservice/dbclient"
 	"github.com/xqtech/goblog/accountservice/model"
+	"github.com/xqtech/goblog/common/messaging"
 )
 
 var DBClient dbclient.IBoltClient
+
+var MessagingClient messaging.IMessagingClient
 
 var client = &http.Client{}
 
@@ -48,6 +52,8 @@ func GetAccount(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Println("Getting account " + accountId)
+
+	notifyVIP(account)
 
 	// If found, marshal into JSON, write headers and content
 	data, _ := json.Marshal(account)
@@ -127,4 +133,19 @@ func getIP() string {
 
 	panic("Unable to determine local IP address (non loopback). Exiting.")
 
+}
+
+// If our hard-coded "VIP" account, spawn a goroutine to send a message.
+func notifyVIP(account model.Account) {
+
+	if account.Id == "10000" {
+		go func(account model.Account) {
+			vipNotification := model.VipNotification{AccountId: account.Id, ReadAt: time.Now().UTC().String()}
+			data, _ := json.Marshal(vipNotification)
+			err := MessagingClient.PublishOnQueue(data, "vip_queue")
+			if err != nil {
+				fmt.Println(err.Error())
+			}
+		}(account)
+	}
 }

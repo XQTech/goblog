@@ -5,16 +5,26 @@ import (
 	"fmt"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/h2non/gock"
 	. "github.com/smartystreets/goconvey/convey"
+	"github.com/stretchr/testify/mock"
 	"github.com/xqtech/goblog/accountservice/dbclient"
 	"github.com/xqtech/goblog/accountservice/model"
+	"github.com/xqtech/goblog/common/messaging"
 )
 
 func init() {
 	gock.InterceptClient(client)
 }
+
+var mockRepo = &dbclient.MockBoltClient{}
+var mockMessagingClient = &messaging.MockMessagingClient{}
+
+// declare mock types to make test code a bit more readable
+var anyString = mock.AnythingOfType("string")
+var anyByteArray = mock.AnythingOfType("[]uint8") // == []byte
 
 func TestGetAccountWrongPath(t *testing.T) {
 
@@ -82,4 +92,28 @@ func TestGetAccount(t *testing.T) {
 		})
 	})
 
+}
+
+func TestNotificationIsSentForVIPAccount(t *testing.T) {
+
+	// Set up the DB client mock
+	mockRepo.On("QueryAccount", "10000").Return(model.Account{Id: "10000", Name: "Person_10000"}, nil)
+
+	DBClient = mockRepo
+	mockMessagingClient.On("PublishOnQueue", anyByteArray, anyString).Return(nil)
+	MessagingClient = mockMessagingClient
+
+	Convey("Given a HTTP req for a VIP account", t, func() {
+		req := httptest.NewRequest("GET", "/accounts/10000", nil)
+		resp := httptest.NewRecorder()
+		Convey("When the request is handled by the Router", func() {
+			NewRouter().ServeHTTP(resp, req)
+			Convey("Then the response should be a 200 and the MessageClient should have been invoked", func() {
+
+				So(resp.Code, ShouldEqual, 200)
+				time.Sleep(time.Millisecond * 10) // Sleep since the Assert below occurs in goroutine
+				So(mockMessagingClient.AssertNumberOfCalls(t, "PublishOnQueue", 1), ShouldBeTrue)
+			})
+		})
+	})
 }

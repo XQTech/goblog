@@ -5,9 +5,11 @@ import (
 	"fmt"
 
 	"github.com/spf13/viper"
-	"github.com/xqtech/goblog/accountservice/config"
+
 	"github.com/xqtech/goblog/accountservice/dbclient"
 	"github.com/xqtech/goblog/accountservice/service"
+	"github.com/xqtech/goblog/common/config"
+	"github.com/xqtech/goblog/common/messaging"
 )
 
 var appName = "accountservice"
@@ -39,7 +41,7 @@ func main() {
 		viper.GetString("configBranch"))
 
 	initializeBoltClient()
-
+	initializeMessaging()
 	go config.StartListener(appName, viper.GetString("amqp_server_url"), viper.GetString("config_event_bus"))
 	service.StartWebServer(viper.GetString("server_port"))
 
@@ -51,4 +53,20 @@ func initializeBoltClient() {
 	service.DBClient = &dbclient.BoltClient{}
 	service.DBClient.OpenBoltDb()
 	service.DBClient.Seed()
+}
+
+// Call this from the main method.
+
+func initializeMessaging() {
+
+	if !viper.IsSet("amqp_server_url") {
+		panic("No 'amqp_server_url' set in configuration, cannot start")
+	}
+
+	//log.println("is amqp_server_url set???-----" + viper.IsSet("amqp_server_url"))
+	//log.println("amqp_server_url-----" + viper.GetString("amqp_server_url"))
+	service.MessagingClient = &messaging.MessagingClient{}
+	service.MessagingClient.ConnectToBroker(viper.GetString("amqp_server_url"))
+	service.MessagingClient.Subscribe(viper.GetString("config_event_bus"), "topic", appName, config.HandleRefreshEvent)
+
 }
