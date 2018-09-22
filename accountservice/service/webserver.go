@@ -1,19 +1,22 @@
 package service
 
 import (
-	"log"
 	"net/http"
+
+	"github.com/sirupsen/logrus"
 )
 
+// StartWebServer starts a web server at the designated port.
 func StartWebServer(port string) {
 
 	r := NewRouter()
 	http.Handle("/", r)
-	log.Println("Start HTTP service at " + port)
+
+	logrus.Infof("Starting HTTP service at %v", port)
 	err := http.ListenAndServe(":"+port, nil)
 
 	if err != nil {
-		log.Println("An error occured starting HTTP listener at port" + port)
-		log.Println("Error: " + err.Error())
+		logrus.Errorln("An error occured starting HTTP listener at port " + port)
+		logrus.Errorln("Error: " + err.Error())
 	}
 }

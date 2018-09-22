@@ -1,28 +1,33 @@
 package messaging
 
 import (
+	"context"
 	"fmt"
-	"log"
 
+	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/sirupsen/logrus"
 	"github.com/streadway/amqp"
+	"github.com/xqtech/goblog/common/tracing"
 )
 
-// Defines our interface for connecting and consuming messages.
+// IMessagingClient defines our interface for connecting and consuming messages.
 type IMessagingClient interface {
 	ConnectToBroker(connectionString string)
 	Publish(msg []byte, exchangeName string, exchangeType string) error
 	PublishOnQueue(msg []byte, queueName string) error
+	PublishOnQueueWithContext(ctx context.Context, msg []byte, queueName string) error
 	Subscribe(exchangeName string, exchangeType string, consumerName string, handlerFunc func(amqp.Delivery)) error
 	SubscribeToQueue(queueName string, consumerName string, handlerFunc func(amqp.Delivery)) error
 	Close()
 }
 
-// Real implementation, encapsulates a pointer to an amqp.Connection
-type MessagingClient struct {
+// AmqpClient is our real implementation, encapsulates a pointer to an amqp.Connection
+type AmqpClient struct {
 	conn *amqp.Connection
 }
 
-func (m *MessagingClient) ConnectToBroker(connectionString string) {
+// ConnectToBroker connects to an AMQP broker using the supplied connectionString.
+func (m *AmqpClient) ConnectToBroker(connectionString string) {
 	if connectionString == "" {
 		panic("Cannot initialize connection to broker, connectionString not set. Have you initialized?")
 	}
@@ -34,7 +39,8 @@ func (m *MessagingClient) ConnectToBroker(connectionString string) {
 	}
 }
 
-func (m *MessagingClient) Publish(body []byte, exchangeName string, exchangeType string) error {
+// Publish publishes a message to the named exchange.
+func (m *AmqpClient) Publish(body []byte, exchangeName string, exchangeType string) error {
 	if m.conn == nil {
 		panic("Tried to send message before connection was initialized. Don't do that.")
 	}
@@ -76,11 +82,12 @@ func (m *MessagingClient) Publish(body []byte, exchangeName string, exchangeType
 		amqp.Publishing{
 			Body: body, // Our JSON body as []byte
 		})
-	fmt.Printf("A message was sent: %v", body)
+	logrus.Infof("A message was sent: %v", string(body))
 	return err
 }
 
-func (m *MessagingClient) PublishOnQueue(body []byte, queueName string) error {
+// PublishOnQueueWithContext publishes the supplied body onto the named queue, passing the context.
+func (m *AmqpClient) PublishOnQueueWithContext(ctx context.Context, body []byte, queueName string) error {
 	if m.conn == nil {
 		panic("Tried to send message before connection was initialized. Don't do that.")
 	}
@@ -102,15 +109,37 @@ func (m *MessagingClient) PublishOnQueue(body []byte, queueName string) error {
 		queue.Name, // routing key
 		false,      // mandatory
 		false,      // immediate
-		amqp.Publishing{
-			ContentType: "application/json",
-			Body:        body, // Our JSON body as []byte
-		})
-	fmt.Printf("A message was sent to queue %v: %v", queueName, body)
+		buildMessage(ctx, body))
+	logrus.Infof("A message was sent to queue %v: %v", queueName, string(body))
 	return err
 }
 
-func (m *MessagingClient) Subscribe(exchangeName string, exchangeType string, consumerName string, handlerFunc func(amqp.Delivery)) error {
+func buildMessage(ctx context.Context, body []byte) amqp.Publishing {
+	publishing := amqp.Publishing{
+		ContentType: "application/json",
+		Body:        body, // Our JSON body as []byte
+	}
+	if ctx != nil {
+		child := tracing.StartChildSpanFromContext(ctx, "messaging")
+		defer child.Finish()
+		var val = make(opentracing.TextMapCarrier)
+		err := tracing.AddTracingToTextMapCarrier(child, val)
+		if err != nil {
+			logrus.Errorf("Error injecting span context: %v", err.Error())
+		} else {
+			publishing.Headers = tracing.CarrierToMap(val)
+		}
+	}
+	return publishing
+}
+
+// PublishOnQueue publishes the supplied body on the queueName.
+func (m *AmqpClient) PublishOnQueue(body []byte, queueName string) error {
+	return m.PublishOnQueueWithContext(nil, body, queueName)
+}
+
+// Subscribe registers a handler function for a given exchange.
+func (m *AmqpClient) Subscribe(exchangeName string, exchangeType string, consumerName string, handlerFunc func(amqp.Delivery)) error {
 	ch, err := m.conn.Channel()
 	failOnError(err, "Failed to open a channel")
 	// defer ch.Close()
@@ -126,7 +155,7 @@ func (m *MessagingClient) Subscribe(exchangeName string, exchangeType string, co
 	)
 	failOnError(err, "Failed to register an Exchange")
 
-	log.Printf("declared Exchange, declaring Queue (%s)", "")
+	logrus.Printf("declared Exchange, declaring Queue (%s)", "")
 	queue, err := ch.QueueDeclare(
 		"",    // name of the queue
 		false, // durable
@@ -137,7 +166,7 @@ func (m *MessagingClient) Subscribe(exchangeName string, exchangeType string, co
 	)
 	failOnError(err, "Failed to register an Queue")
 
-	log.Printf("declared Queue (%d messages, %d consumers), binding to Exchange (key '%s')",
+	logrus.Printf("declared Queue (%d messages, %d consumers), binding to Exchange (key '%s')",
 		queue.Messages, queue.Consumers, exchangeName)
 
 	err = ch.QueueBind(
@@ -166,11 +195,12 @@ func (m *MessagingClient) Subscribe(exchangeName string, exchangeType string, co
 	return nil
 }
 
-func (m *MessagingClient) SubscribeToQueue(queueName string, consumerName string, handlerFunc func(amqp.Delivery)) error {
+// SubscribeToQueue registers a handler function for the named queue.
+func (m *AmqpClient) SubscribeToQueue(queueName string, consumerName string, handlerFunc func(amqp.Delivery)) error {
 	ch, err := m.conn.Channel()
 	failOnError(err, "Failed to open a channel")
 
-	log.Printf("Declaring Queue (%s)", queueName)
+	logrus.Printf("Declaring Queue (%s)", queueName)
 	queue, err := ch.QueueDeclare(
 		queueName, // name of the queue
 		false,     // durable
@@ -196,7 +226,8 @@ func (m *MessagingClient) SubscribeToQueue(queueName string, consumerName string
 	return nil
 }
 
-func (m *MessagingClient) Close() {
+// Close closes the connection to the AMQP-broker, if available.
+func (m *AmqpClient) Close() {
 	if m.conn != nil {
 		m.conn.Close()
 	}
@@ -211,7 +242,7 @@ func consumeLoop(deliveries <-chan amqp.Delivery, handlerFunc func(d amqp.Delive
 
 func failOnError(err error, msg string) {
 	if err != nil {
-		fmt.Printf("%s: %s", msg, err)
+		logrus.Errorf("%s: %s", msg, err)
 		panic(fmt.Sprintf("%s: %s", msg, err))
 	}
 }

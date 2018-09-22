@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http/httptest"
@@ -8,58 +9,48 @@ import (
 	"time"
 
 	"github.com/h2non/gock"
+	opentracing "github.com/opentracing/opentracing-go"
 	. "github.com/smartystreets/goconvey/convey"
 	"github.com/stretchr/testify/mock"
 	"github.com/xqtech/goblog/accountservice/dbclient"
 	"github.com/xqtech/goblog/accountservice/model"
 	"github.com/xqtech/goblog/common/messaging"
+	"github.com/xqtech/goblog/common/tracing"
 )
 
-func init() {
-	gock.InterceptClient(client)
-}
+// mocks for boltdb and messsaging
+var mockRepo *dbclient.MockBoltClient
+var mockMessagingClient *messaging.MockMessagingClient
 
-var mockRepo = &dbclient.MockBoltClient{}
-var mockMessagingClient = &messaging.MockMessagingClient{}
-
-// declare mock types to make test code a bit more readable
+// mock types
 var anyString = mock.AnythingOfType("string")
-var anyByteArray = mock.AnythingOfType("[]uint8") // == []byte
+var anyByteArray = mock.AnythingOfType("[]uint8")
 
-func TestGetAccountWrongPath(t *testing.T) {
-
-	Convey("Given a HTTP request for /invalid/123", t, func() {
-		req := httptest.NewRequest("GET", "/invalid/123", nil)
-		resp := httptest.NewRecorder()
-
-		Convey("When the request is handled by the Router", func() {
-			NewRouter().ServeHTTP(resp, req)
-			Convey("Then the response should be a 404", func() {
-				So(resp.Code, ShouldEqual, 404)
-			})
-		})
-	})
+// Run this first in each test, poor substitute for a proper @Before func
+func reset() {
+	mockRepo = &dbclient.MockBoltClient{}
+	mockMessagingClient = &messaging.MockMessagingClient{}
+	gock.InterceptClient(client)
+	tracing.SetTracer(opentracing.NoopTracer{})
 }
 
 func TestGetAccount(t *testing.T) {
+	reset()
 	defer gock.Off()
-
 	gock.New("http://quotes-service:8080").
 		Get("/api/quote").
 		MatchParam("strength", "4").
 		Reply(200).
-		BodyString(`{"quote":"May the source be with you. Always.","ipAddress":"10.0.0.5:8080","language":"en"}`)
+		BodyString(`{"quote":"May the source be with you, always.","ipAddress":"10.0.0.5:8080","language":"en"}`)
+	gock.New("http://imageservice:7777").
+		Get("/accounts/10000").
+		Reply(200).
+		BodyString(`{"imageUrl":"http://test.path"}`)
 
-	// Create a mock instance that implements the IBoltClient interface
-	mockRepo := &dbclient.MockBoltClient{}
-
-	// Declare two mock behaviours. For "123" as input, return a proper Account struct and nil as error.
-	// For "456" as input, return an empty Account object and a real error.
-	mockRepo.On("QueryAccount", "123").Return(model.Account{Id: "123", Name: "Person_123"}, nil)
-	mockRepo.On("QueryAccount", "456").Return(model.Account{}, fmt.Errorf("Some error"))
-
-	// Finally, assign mockRepo to the DBClient field (it's in _handlers.go_, e.g. in the same package)
+	mockRepo.On("QueryAccount", mock.Anything, "123").Return(model.Account{ID: "123", Name: "Person_123"}, nil)
+	mockRepo.On("QueryAccount", mock.Anything, "456").Return(model.Account{}, fmt.Errorf("Some error"))
 	DBClient = mockRepo
+
 	Convey("Given a HTTP request for /accounts/123", t, func() {
 		req := httptest.NewRequest("GET", "/accounts/123", nil)
 		resp := httptest.NewRecorder()
@@ -72,9 +63,9 @@ func TestGetAccount(t *testing.T) {
 
 				account := model.Account{}
 				json.Unmarshal(resp.Body.Bytes(), &account)
-				So(account.Id, ShouldEqual, "123")
+				So(account.ID, ShouldEqual, "123")
 				So(account.Name, ShouldEqual, "Person_123")
-				So(account.Quote.Text, ShouldEqual, "May the source be with you. Always.")
+				So(account.Quote.Text, ShouldEqual, "May the source be with you, always.")
 			})
 		})
 	})
@@ -91,16 +82,76 @@ func TestGetAccount(t *testing.T) {
 			})
 		})
 	})
+}
 
+func TestGetAccountWrongPath(t *testing.T) {
+	reset()
+	Convey("Given a HTTP request for /invalid/123", t, func() {
+		req := httptest.NewRequest("GET", "/invalid/123", nil)
+		resp := httptest.NewRecorder()
+
+		Convey("When the request is handled by the Router", func() {
+			NewRouter().ServeHTTP(resp, req)
+
+			Convey("Then the response should be a 404", func() {
+				So(resp.Code, ShouldEqual, 404)
+			})
+		})
+	})
+}
+
+func TestGetAccountNoQuote(t *testing.T) {
+	reset()
+	defer gock.Off()
+	gock.New("http://quotes-service:8080").
+		Get("/api/quote").
+		MatchParam("strength", "4").
+		Reply(500)
+	gock.New("http://imageservice:7777").
+		Get("/accounts/10000").
+		Reply(200).
+		BodyString(`{"imageUrl":"http://test.path"}`)
+
+	mockRepo := &dbclient.MockBoltClient{}
+	mockRepo.On("QueryAccount", mock.Anything, "123").Return(model.Account{ID: "123", Name: "Person_123"}, nil)
+	DBClient = mockRepo
+
+	Convey("Given a HTTP request for /accounts/123", t, func() {
+		req := httptest.NewRequest("GET", "/accounts/123", nil).WithContext(context.TODO())
+		resp := httptest.NewRecorder()
+
+		Convey("When the request is handled by the Router", func() {
+			NewRouter().ServeHTTP(resp, req)
+
+			Convey("Then the response should be a 200", func() {
+				So(resp.Code, ShouldEqual, 200)
+
+				account := model.Account{}
+				json.Unmarshal(resp.Body.Bytes(), &account)
+				So(account.ID, ShouldEqual, "123")
+				So(account.Name, ShouldEqual, "Person_123")
+				So(account.Quote.Text, ShouldEqual, "May the source be with you, always.")
+			})
+		})
+	})
 }
 
 func TestNotificationIsSentForVIPAccount(t *testing.T) {
+	reset()
+	gock.New("http://quotes-service:8080").
+		Get("/api/quote").
+		MatchParam("strength", "4").
+		Reply(200).
+		BodyString(`{"quote":"May the source be with you, always.","ipAddress":"10.0.0.5:8080","language":"en"}`)
+	gock.New("http://imageservice:7777").
+		Get("/accounts/10000").
+		Reply(200).
+		BodyString(`{"imageUrl":"http://test.path"}`)
 
-	// Set up the DB client mock
-	mockRepo.On("QueryAccount", "10000").Return(model.Account{Id: "10000", Name: "Person_10000"}, nil)
-
+	mockRepo.On("QueryAccount", mock.Anything, "10000").Return(model.Account{ID: "10000", Name: "Person_10000"}, nil)
 	DBClient = mockRepo
-	mockMessagingClient.On("PublishOnQueue", anyByteArray, anyString).Return(nil)
+
+	mockMessagingClient.On("PublishOnQueueWithContext", mock.Anything, anyByteArray, anyString).Return(nil)
 	MessagingClient = mockMessagingClient
 
 	Convey("Given a HTTP req for a VIP account", t, func() {
@@ -109,10 +160,45 @@ func TestNotificationIsSentForVIPAccount(t *testing.T) {
 		Convey("When the request is handled by the Router", func() {
 			NewRouter().ServeHTTP(resp, req)
 			Convey("Then the response should be a 200 and the MessageClient should have been invoked", func() {
-
 				So(resp.Code, ShouldEqual, 200)
 				time.Sleep(time.Millisecond * 10) // Sleep since the Assert below occurs in goroutine
-				So(mockMessagingClient.AssertNumberOfCalls(t, "PublishOnQueue", 1), ShouldBeTrue)
+				So(mockMessagingClient.AssertNumberOfCalls(t, "PublishOnQueueWithContext", 1), ShouldBeTrue)
+			})
+		})
+	})
+}
+
+func TestHealthCheckOk(t *testing.T) {
+	reset()
+	mockRepo.On("Check").Return(true)
+	DBClient = mockRepo
+
+	Convey("Given a HTTP req for /health", t, func() {
+
+		req := httptest.NewRequest("GET", "/health", nil)
+		resp := httptest.NewRecorder()
+		Convey("When served", func() {
+			NewRouter().ServeHTTP(resp, req)
+			Convey("Then expect 200 OK", func() {
+				So(resp.Code, ShouldEqual, 200)
+			})
+		})
+	})
+}
+
+func TestHealthCheckFailsDueToDb(t *testing.T) {
+	reset()
+	mockRepo.On("Check").Return(false)
+	DBClient = mockRepo
+
+	Convey("Given a HTTP req for /health", t, func() {
+
+		req := httptest.NewRequest("GET", "/health", nil)
+		resp := httptest.NewRecorder()
+		Convey("When served", func() {
+			NewRouter().ServeHTTP(resp, req)
+			Convey("Then expect 503 Service Unavailable", func() {
+				So(resp.Code, ShouldEqual, 503)
 			})
 		})
 	})

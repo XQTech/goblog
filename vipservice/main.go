@@ -26,15 +26,18 @@ package main
 import (
 	"flag"
 	"fmt"
+	"time"
 
 	"os"
 	"os/signal"
 	"syscall"
 
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 	"github.com/streadway/amqp"
 	"github.com/xqtech/goblog/common/config"
 	"github.com/xqtech/goblog/common/messaging"
+	"github.com/xqtech/goblog/common/tracing"
 	"github.com/xqtech/goblog/vipservice/service"
 )
 
@@ -43,21 +46,23 @@ var appName = "vipservice"
 var messagingClient messaging.IMessagingClient
 
 func init() {
-	configServerUrl := flag.String("configServerUrl", "http://configserver:8888", "Address to config server")
+	configServerURL := flag.String("configServerUrl", "http://configserver:8888", "Address to config server")
 	profile := flag.String("profile", "test", "Environment profile, something similar to spring profiles")
 	configBranch := flag.String("configBranch", "master", "git branch to fetch configuration from")
 	flag.Parse()
 
 	viper.Set("profile", *profile)
-	viper.Set("configServerUrl", *configServerUrl)
+	viper.Set("configServerUrl", *configServerURL)
 	viper.Set("configBranch", *configBranch)
 }
 
 func main() {
-	fmt.Println("Starting " + appName + "...")
+	logrus.SetFormatter(&logrus.JSONFormatter{})
+	logrus.Println("Starting " + appName + "...")
 
 	config.LoadConfigurationFromBranch(viper.GetString("configServerUrl"), appName, viper.GetString("profile"), viper.GetString("configBranch"))
 	initializeMessaging()
+	initializeTracing()
 
 	// Makes sure connection is closed when service exits.
 	handleSigterm(func() {
@@ -68,15 +73,37 @@ func main() {
 	service.StartWebServer(viper.GetString("server_port"))
 }
 
+func initializeTracing() {
+	tracing.InitTracing(viper.GetString("zipkin_server_url"), appName)
+}
+
 func onMessage(delivery amqp.Delivery) {
-	fmt.Printf("Got a message: %v\n", string(delivery.Body))
+	logrus.Infof("Got a message: %v\n", string(delivery.Body))
+
+	defer tracing.StartTraceFromCarrier(delivery.Headers, "vipservice#onMessage").Finish()
+
+	// Experimental!
+	//carrier := make(opentracing.HTTPHeadersCarrier)
+	//for k, v := range delivery.Headers {
+	//        carrier.Set(k, v.(string))
+	//}
+	//
+	//clientContext, err := tracing.Tracer.Extract(opentracing.HTTPHeaders, carrier)
+	//var span opentracing.Span
+	//if err == nil {
+	//        span = tracing.Tracer.StartSpan(
+	//                "vipservice onMessage", ext.RPCServerOption(clientContext))
+	//} else {
+	//        span = tracing.Tracer.StartSpan("vipservice onMessage")
+	//}
+	time.Sleep(time.Millisecond * 10)
 }
 
 func initializeMessaging() {
 	if !viper.IsSet("amqp_server_url") {
 		panic("No 'broker_url' set in configuration, cannot start")
 	}
-	messagingClient = &messaging.MessagingClient{}
+	messagingClient = &messaging.AmqpClient{}
 	messagingClient.ConnectToBroker(viper.GetString("amqp_server_url"))
 
 	// Call the subscribe method with queue name and callback function
@@ -85,6 +112,8 @@ func initializeMessaging() {
 
 	err = messagingClient.Subscribe(viper.GetString("config_event_bus"), "topic", appName, config.HandleRefreshEvent)
 	failOnError(err, "Could not start subscribe to "+viper.GetString("config_event_bus")+" topic")
+
+	logrus.Infoln("Successfully initialized messaging for vipservice")
 }
 
 // Handles Ctrl+C or most other means of "controlled" shutdown gracefully. Invokes the supplied func before exiting.
@@ -101,7 +130,7 @@ func handleSigterm(handleExit func()) {
 
 func failOnError(err error, msg string) {
 	if err != nil {
-		fmt.Printf("%s: %s", msg, err)
+		logrus.Errorf("%s: %s", msg, err)
 		panic(fmt.Sprintf("%s: %s", msg, err))
 	}
 }

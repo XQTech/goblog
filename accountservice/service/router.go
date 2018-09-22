@@ -1,21 +1,33 @@
 package service
 
 import (
+	"net/http"
+
 	"github.com/gorilla/mux"
+	"github.com/xqtech/goblog/common/tracing"
 )
 
+// NewRouter creates a mux.Router pointer.
 func NewRouter() *mux.Router {
 
-	//Create an instance of the Gorilla router
 	router := mux.NewRouter().StrictSlash(true)
-
-	//Iterate over the routes we declared in routes.go
-	//and attach them to the router instance
 	for _, route := range routes {
+
 		router.Methods(route.Method).
 			Path(route.Pattern).
 			Name(route.Name).
-			Handler(route.HandlerFunc)
+			Handler(loadTracing(route.HandlerFunc))
+
 	}
 	return router
+}
+
+func loadTracing(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		span := tracing.StartHTTPTrace(req, "GetAccount")
+		defer span.Finish()
+
+		ctx := tracing.UpdateContext(req.Context(), span)
+		next.ServeHTTP(rw, req.WithContext(ctx))
+	})
 }
